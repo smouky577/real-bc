@@ -1,0 +1,44 @@
+<?xml version="1.0" encoding="utf-8"?>
+<LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    android:layout_width="match_parent"
+    android:layout_height="wrap_content"
+    android:gravity="center_vertical"
+    android:orientation="horizontal">
+
+    <EditText
+        android:id="@+id/v0Input"
+        android:layout_width="0dp"
+        android:layout_height="wrap_content"
+        android:layout_weight="1"
+        android:hint="@string/v0_row_hint"
+        android:inputType="numberDecimal"
+        android:textColor="@color/ink"
+        android:textColorHint="@color/muted" />
+
+    <EditText
+        android:id="@+id/distanceInput"
+        android:layout_width="0dp"
+        android:layout_height="wrap_content"
+        android:layout_weight="1"
+        android:hint="@string/distance_hint"
+        android:inputType="numberDecimal"
+        android:textColor="@color/ink"
+        android:textColorHint="@color/muted" />
+
+    <EditText
+        android:id="@+id/speedInput"
+        android:layout_width="0dp"
+        android:layout_height="wrap_content"
+        android:layout_weight="1"
+        android:hint="@string/speed_hint"
+        android:inputType="numberDecimal"
+        android:textColor="@color/ink"
+        android:textColorHint="@color/muted" />
+
+    <com.google.android.material.button.MaterialButton
+        android:id="@+id/removeShot"
+        style="@style/Widget.Material3.Button.TextButton"
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:text="@string/remove_shot" />
+</LinearLayout>
