@@ -291,10 +291,10 @@ class MainActivity : AppCompatActivity() {
         val token = ++generation
         binding.result.text = t("Смятам…", "Calculating…")
         binding.export.isEnabled = false
-        val ratio = BcSolver.densityRatio(temp, alt)
+        val air = Air.of(temp, alt)
         val exportV0 = shots.map { it.v0 }.average()
         Thread {
-            val fit = BcSolver.fit(shots, ratio)
+            val fit = BcSolver.fit(shots, air)
             val load = LoadFile.Load(name, weight, exportV0, fit.bc, temp, alt, shots)
             runOnUiThread {
                 if (token != generation) return@runOnUiThread
