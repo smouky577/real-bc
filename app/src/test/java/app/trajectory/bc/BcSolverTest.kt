@@ -36,6 +36,72 @@ class BcSolverTest {
         assertTrue(low < 280.0)
     }
 
+    private fun cdmShots(air: Air, bc: Double, slope: Double, center: Double, noise: List<Double> = emptyList()): List<Shot> {
+        val shots = ArrayList<Shot>()
+        var i = 0
+        for (v0 in listOf(285.0, 245.0)) for (d in listOf(50.0, 100.0)) {
+            val v = BcSolver.speedAt(v0, d, bc, air, DragModel.G1, slope, center)
+            shots.add(Shot(d, v + noise.getOrElse(i++) { 0.0 }, v0))
+        }
+        return shots
+    }
+
+    @Test
+    fun cdmRecoversBcThatChangesWithSpeed() {
+        val air = Air.of(15.0, 0.0)
+        val shots = cdmShots(air, bc = 0.10, slope = 2.0, center = 0.75)
+        val cdm = BcSolver.fitCdm(shots, air)!!
+        for (mach in listOf(cdm.machMin, cdm.machCenter, cdm.machMax)) {
+            val truth = BcSolver.bcAtMach(0.10, 2.0, 0.75, mach)
+            val fitted = BcSolver.bcAtMach(cdm.bc, cdm.slope, cdm.machCenter, mach)
+            assertEquals("mach $mach", truth, fitted, truth * 0.01)
+        }
+        assertTrue(cdm.significant)
+        assertTrue(cdm.meanAbsErrorMps < 0.05)
+        assertTrue(cdm.points.first().mach < cdm.points.last().mach)
+    }
+
+    @Test
+    fun cdmWithChronoNoiseStaysClose() {
+        val air = Air.of(20.0, 300.0)
+        val shots = cdmShots(air, 0.10, 2.0, 0.75, noise = listOf(0.3, -0.3, -0.3, 0.3))
+        val cdm = BcSolver.fitCdm(shots, air)!!
+        for (mach in listOf(cdm.machMin, cdm.machMax)) {
+            val truth = BcSolver.bcAtMach(0.10, 2.0, 0.75, mach)
+            val fitted = BcSolver.bcAtMach(cdm.bc, cdm.slope, cdm.machCenter, mach)
+            assertEquals("mach $mach", truth, fitted, truth * 0.06)
+        }
+    }
+
+    @Test
+    fun cdmOnConstantBcIsNotSignificant() {
+        val air = Air.of(15.0, 0.0)
+        val cdm = BcSolver.fitCdm(cdmShots(air, 0.10, 0.0, 0.75), air)!!
+        assertEquals(0.0, cdm.changePct, 0.5)
+        assertTrue(!cdm.significant)
+    }
+
+    @Test
+    fun cdmNeedsTwoIntervals() {
+        val air = Air.of(15.0, 0.0)
+        val v = BcSolver.speedAt(280.0, 50.0, 0.1, air)
+        assertEquals(null, BcSolver.fitCdm(listOf(Shot(50.0, v, 280.0), Shot(50.0, v + 0.2, 280.0)), air))
+    }
+
+    @Test
+    fun cdmFileRoundTrip() {
+        val cdm = listOf(CdmPoint(0.70, 0.105), CdmPoint(0.75, 0.100), CdmPoint(0.80, 0.0952))
+        val load = LoadFile.Load("S", 3.5, 280.0, 0.1, 15.0, 0.0, listOf(Shot(50.0, 260.0, 280.0)), cdm)
+        val text = LoadFile.parse(LoadFile.machineBlock(load))!!
+        assertEquals(3, text.cdm?.size)
+        assertEquals(0.0952, text.cdm!![2].bc, 1e-6)
+        val json = LoadFile.parse(LoadFile.json(load))!!
+        assertEquals(3, json.cdm?.size)
+        assertEquals(0.75, json.cdm!![1].mach, 1e-6)
+        assertEquals(1, json.shots.size)
+        assertEquals(null, LoadFile.parse(LoadFile.machineBlock(load.copy(cdm = null)))!!.cdm)
+    }
+
     /**
      * Reference speeds from Ballistic Scope `BallisticEngine.solve(...).impactVelocityMps`
      * (weather on, pressure = 1013.25·exp(−alt/8500), zero 50 m, scope 51 mm), run on 2026-11-28.

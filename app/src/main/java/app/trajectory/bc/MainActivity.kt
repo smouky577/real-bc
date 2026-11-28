@@ -51,6 +51,7 @@ class MainActivity : AppCompatActivity() {
     private var generation = 0
     private var lastLoad: LoadFile.Load? = null
     private var lastFit: Fit? = null
+    private var lastCdm: CdmFit? = null
     private var bulgarian = true
 
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -161,7 +162,7 @@ class MainActivity : AppCompatActivity() {
         }
         val fit = lastFit
         val load = lastLoad
-        if (fit != null && load != null) binding.result.text = describe(load, fit)
+        if (fit != null && load != null) binding.result.text = describe(load, fit, lastCdm)
     }
 
     private fun applyV0Mode() {
@@ -295,18 +296,52 @@ class MainActivity : AppCompatActivity() {
         val exportV0 = shots.map { it.v0 }.average()
         Thread {
             val fit = BcSolver.fit(shots, air)
-            val load = LoadFile.Load(name, weight, exportV0, fit.bc, temp, alt, shots)
+            val cdm = BcSolver.fitCdm(shots, air)
+            // The curve goes into the file only when it is above the chronograph noise.
+            val exportCdm = cdm?.takeIf { it.significant }?.points
+            val load = LoadFile.Load(name, weight, exportV0, fit.bc, temp, alt, shots, exportCdm)
             runOnUiThread {
                 if (token != generation) return@runOnUiThread
                 lastFit = fit
+                lastCdm = cdm
                 lastLoad = load
-                binding.result.text = describe(load, fit)
+                binding.result.text = describe(load, fit, cdm)
                 binding.export.isEnabled = true
             }
         }.start()
     }
 
-    private fun describe(load: LoadFile.Load, fit: Fit): String {
+    private fun describeCdm(cdm: CdmFit?, loc: Locale): String = when {
+        cdm == null -> t(
+            "CDM: нужни са поне 2 дистанции или 2 различни V0.",
+            "CDM: needs at least 2 distances or 2 different V0.",
+        )
+        else -> buildString {
+            append(
+                String.format(
+                    loc,
+                    t(
+                        "CDM (%.0f–%.0f м/с): BC %.4f при %.0f м/с, %.4f при %.0f м/с, разлика %+.1f %% ± %.1f %%\n",
+                        "CDM (%.0f–%.0f m/s): BC %.4f at %.0f m/s, %.4f at %.0f m/s, change %+.1f %% ± %.1f %%\n",
+                    ),
+                    cdm.speedMin, cdm.speedMax, cdm.bcFast, cdm.speedMax, cdm.bcSlow, cdm.speedMin,
+                    cdm.changePct, cdm.changeSdPct,
+                ),
+            )
+            append(
+                if (cdm.significant) {
+                    t("CDM влиза в експорта. В Ballistic Scope изберете CDM.", "CDM is in the export. Choose CDM in Ballistic Scope.")
+                } else {
+                    t(
+                        "CDM не влиза в експорта: разликата е в рамките на шума на хронографа. G1 BC е достатъчен.",
+                        "CDM is not exported: the change is within chronograph noise. The G1 BC is enough.",
+                    )
+                },
+            )
+        }
+    }
+
+    private fun describe(load: LoadFile.Load, fit: Fit, cdm: CdmFit?): String {
         val loc = if (bulgarian) Locale("bg", "BG") else Locale.US
         val text = StringBuilder()
         text.append("BC ").append(String.format(loc, "%.4f", fit.bc)).append('\n')
@@ -333,8 +368,9 @@ class MainActivity : AppCompatActivity() {
         }
         val spread = fit.points.maxOf { it.ownBc } - fit.points.minOf { it.ownBc }
         if (fit.points.size > 1 && spread > 0.01) {
-            text.append(t("Отделните дистанции дават различен BC. Един коефициент е компромис.", "Separate distances give a different BC. One coefficient is a compromise."))
+            text.append(t("Отделните дистанции дават различен BC. Един коефициент е компромис.\n", "Separate distances give a different BC. One coefficient is a compromise.\n"))
         }
+        text.append('\n').append(describeCdm(cdm, loc))
         return text.toString().trim()
     }
 
@@ -343,14 +379,12 @@ class MainActivity : AppCompatActivity() {
         val fit = lastFit ?: return
         val stamp = SimpleDateFormat("yyyyMMdd-HHmmss", Locale.US).format(Date())
         val txtName = "bc-$stamp.txt"
-        val jsonName = "bc-$stamp.json"
         val wroteTxt = saveDownload(txtName, "text/plain", readable(load, fit) + "\n" + LoadFile.machineBlock(load))
-        val wroteJson = saveDownload(jsonName, "application/json", LoadFile.json(load))
-        if (!wroteTxt || !wroteJson) {
+        if (!wroteTxt) {
             Toast.makeText(this, t("Файлът не се записа.", "The file was not saved."), Toast.LENGTH_LONG).show()
             return
         }
-        val note = t("Записано в Download/RealBc:\n$txtName\n$jsonName", "Saved in Download/RealBc:\n$txtName\n$jsonName")
+        val note = t("Записано в Download/RealBc:\n$txtName", "Saved in Download/RealBc:\n$txtName")
         binding.result.append("\n\n$note")
         Toast.makeText(this, t("Записано в Download/RealBc", "Saved in Download/RealBc"), Toast.LENGTH_LONG).show()
     }
@@ -390,6 +424,7 @@ class MainActivity : AppCompatActivity() {
             appendLine(t("Температура: ${String.format(loc, "%.1f", load.temperatureC)} °C", "Temperature: ${String.format(loc, "%.1f", load.temperatureC)} °C"))
             appendLine(t("Височина: ${String.format(loc, "%.0f", load.altitudeM)} м", "Altitude: ${String.format(loc, "%.0f", load.altitudeM)} m"))
             appendLine(t("Двигател: ${BcSolver.MODEL}", "Engine: ${BcSolver.MODEL}"))
+            appendLine(describeCdm(lastCdm, loc))
             appendLine()
             appendLine(t("V0 | дистанция м | измерена | по модела | разлика", "V0 | distance m | measured | model | difference"))
             for (point in fit.points) {

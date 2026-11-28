@@ -2,7 +2,7 @@ package app.trajectory.bc
 
 /**
  * Text block Ballistic Scope imports. Human text may sit above the marker.
- * A JSON object with the same fields is accepted as well.
+ * A JSON object with the same fields is still read (older exports); the app writes only text.
  */
 object LoadFile {
     const val MARKER = "ballisticscope-load 1"
@@ -15,6 +15,8 @@ object LoadFile {
         val temperatureC: Double,
         val altitudeM: Double,
         val shots: List<Shot>,
+        /** CDM: equivalent G1 BC by Mach. Null when the shots cannot carry a curve. */
+        val cdm: List<CdmPoint>? = null,
     )
 
     fun machineBlock(load: Load): String = buildString {
@@ -29,6 +31,8 @@ object LoadFile {
         for (shot in load.shots) {
             appendLine("shot=${fmt(shot.v0)} ${fmt(shot.distanceM)} ${fmt(shot.speedMps)}")
         }
+        // CDM: "mach g1_bc". Older Ballistic Scope ignores these lines and keeps using bc.
+        load.cdm?.forEach { appendLine("cdm=${fmt3(it.mach)} ${fmt(it.bc)}") }
     }
 
     fun json(load: Load): String = buildString {
@@ -42,6 +46,15 @@ object LoadFile {
         appendLine("  \"ballisticCoefficient\": ${fmt(load.bc)},")
         appendLine("  \"temperatureCelsius\": ${fmt(load.temperatureC)},")
         appendLine("  \"altitudeMeters\": ${fmt(load.altitudeM)},")
+        val cdm = load.cdm
+        if (cdm != null) {
+            appendLine("  \"cdm\": [")
+            cdm.forEachIndexed { i, p ->
+                val comma = if (i == cdm.lastIndex) "" else ","
+                appendLine("    {\"mach\": ${fmt3(p.mach)}, \"bc\": ${fmt(p.bc)}}$comma")
+            }
+            appendLine("  ],")
+        }
         appendLine("  \"shots\": [")
         load.shots.forEachIndexed { i, shot ->
             val comma = if (i == load.shots.lastIndex) "" else ","
@@ -67,6 +80,7 @@ object LoadFile {
         var temp = 15.0
         var alt = 0.0
         val rawShots = ArrayList<List<Double>>()
+        val cdm = ArrayList<CdmPoint>()
         for (raw in lines) {
             val line = raw.trim()
             if (line.isEmpty() || line == MARKER) continue
@@ -85,6 +99,10 @@ object LoadFile {
                     val nums = value.split(Regex("\\s+")).mapNotNull(::num)
                     if (nums.size >= 2) rawShots.add(nums)
                 }
+                "cdm" -> {
+                    val nums = value.split(Regex("\\s+")).mapNotNull(::num)
+                    if (nums.size >= 2) cdm.add(CdmPoint(nums[0], nums[1]))
+                }
             }
         }
         val shots = rawShots.mapNotNull { nums ->
@@ -96,7 +114,7 @@ object LoadFile {
         }
         val muzzle = v0 ?: shots.map { it.v0 }.average().takeIf { shots.isNotEmpty() } ?: return null
         val coefficient = bc ?: return null
-        return Load(name.ifBlank { "Снаряд" }, weight, muzzle, coefficient, temp, alt, shots)
+        return Load(name.ifBlank { "Снаряд" }, weight, muzzle, coefficient, temp, alt, shots, cdm.takeIf { it.size >= 2 })
     }
 
     private fun parseJson(text: String): Load? {
@@ -121,13 +139,22 @@ object LoadFile {
             val shotV0 = jsonNum(body, "v0Mps") ?: v0
             shots.add(Shot(distance, speed, shotV0))
         }
-        return Load(name.ifBlank { "Снаряд" }, weight, v0, bc, temp, alt, shots)
+        val cdmSection = Regex(""""cdm"\s*:\s*\[(.*?)]""", RegexOption.DOT_MATCHES_ALL)
+            .find(text)?.groupValues?.get(1).orEmpty()
+        val cdm = Regex("""\{[^{}]*\}""").findAll(cdmSection).mapNotNull { obj ->
+            val mach = jsonNum(obj.value, "mach") ?: return@mapNotNull null
+            val pointBc = jsonNum(obj.value, "bc") ?: return@mapNotNull null
+            CdmPoint(mach, pointBc)
+        }.toList()
+        return Load(name.ifBlank { "Снаряд" }, weight, v0, bc, temp, alt, shots, cdm.takeIf { it.size >= 2 })
     }
 
     private fun jsonNum(body: String, key: String): Double? =
         Regex(""""$key"\s*:\s*(-?\d+(?:\.\d+)?)""").find(body)?.groupValues?.get(1)?.let(::num)
 
     private fun num(raw: String): Double? = raw.trim().replace(',', '.').toDoubleOrNull()
+
+    private fun fmt3(v: Double): String = "%.3f".format(java.util.Locale.US, v)
 
     private fun fmt(v: Double): String = "%.6f".format(java.util.Locale.US, v).trimEnd('0').trimEnd('.')
 

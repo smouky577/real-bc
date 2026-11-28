@@ -41,21 +41,35 @@ object BcSolver {
     fun densityRatio(tempC: Double, altitudeM: Double): Double =
         airDensity(tempC, altitudeM) / SEA_LEVEL_DENSITY
 
+    /**
+     * CDM as an equivalent G1 BC that changes with Mach:
+     * BC(M) = bc / (1 + slope·(M − machCenter)). slope = 0 is the plain G1 BC.
+     */
+    fun bcAtMach(bc: Double, slope: Double, machCenter: Double, mach: Double): Double =
+        bc / (1.0 + slope * (mach - machCenter)).coerceAtLeast(0.2)
+
     /** Drag deceleration per unit speed, so a = −k·v_vec. */
-    private fun dragK(speed: Double, bc: Double, air: Air, model: DragModel): Double {
-        val cd = DragTables.cd(model, speed / air.speedOfSound)
-        return (SEA_LEVEL_DENSITY * air.densityRatio * cd * PI) / (8.0 * bc * BC_KG_PER_M2) * speed
+    private fun dragK(
+        speed: Double, bc: Double, air: Air, model: DragModel, slope: Double, machCenter: Double,
+    ): Double {
+        val mach = speed / air.speedOfSound
+        val cd = DragTables.cd(model, mach)
+        val bcHere = if (slope == 0.0) bc else bcAtMach(bc, slope, machCenter, mach)
+        return (SEA_LEVEL_DENSITY * air.densityRatio * cd * PI) / (8.0 * bcHere * BC_KG_PER_M2) * speed
     }
 
     /** Speed after [distanceM] metres, barrel horizontal, no wind. Stops exactly at the distance. */
-    fun speedAt(v0: Double, distanceM: Double, bc: Double, air: Air, model: DragModel = DragModel.G1): Double {
+    fun speedAt(
+        v0: Double, distanceM: Double, bc: Double, air: Air, model: DragModel = DragModel.G1,
+        slope: Double = 0.0, machCenter: Double = 0.0,
+    ): Double {
         var x = 0.0
         var vx = v0
         var vy = 0.0
         var steps = 0
         val maxSteps = 80_000
         fun k(vx: Double, vy: Double): Double =
-            dragK(sqrt(vx * vx + vy * vy).coerceAtLeast(1e-6), bc, air, model)
+            dragK(sqrt(vx * vx + vy * vy).coerceAtLeast(1e-6), bc, air, model, slope, machCenter)
         while (x < distanceM && steps < maxSteps && vx > 5.0) {
             val k1 = k(vx, vy)
             val a1x = -k1 * vx
@@ -139,6 +153,110 @@ object BcSolver {
         return Fit(bc = bc, points = points, meanAbsErrorMps = meanAbs, limited = atClamp && meanAbs > 1.0)
     }
 
+    /**
+     * Fits CDM (level + slope of BC over Mach) to all shots. Needs at least two different
+     * speed intervals: two distances, or two V0. Returns null when the data cannot carry a slope.
+     * [chronoSigmaMps] is the assumed chronograph error, used for the uncertainty.
+     */
+    fun fitCdm(shots: List<Shot>, air: Air, chronoSigmaMps: Double = 0.5): CdmFit? {
+        val groups = shots.map { Math.round(it.v0 * 2) to Math.round(it.distanceM * 2) }.toSet()
+        if (groups.size < 2) return null
+        val sos = air.speedOfSound
+        val machMin = shots.minOf { it.speedMps } / sos
+        val machMax = shots.maxOf { it.v0 } / sos
+        if (machMax - machMin < 0.02) return null
+        val center = (machMin + machMax) / 2.0
+        val base = fit(shots, air).bc
+
+        fun cost(bc: Double, slope: Double): Double {
+            var sum = 0.0
+            for (s in shots) {
+                val d = speedAt(s.v0, s.distanceM, bc, air, DragModel.G1, slope, center) - s.speedMps
+                sum += d * d
+            }
+            return sum
+        }
+
+        fun bestBc(slope: Double): Pair<Double, Double> {
+            var lo = (base / 1.6).coerceIn(BC_MIN, BC_MAX)
+            var hi = (base * 1.6).coerceIn(BC_MIN, BC_MAX)
+            repeat(30) {
+                val m1 = lo + (hi - lo) / 3.0
+                val m2 = hi - (hi - lo) / 3.0
+                if (cost(m1, slope) <= cost(m2, slope)) hi = m2 else lo = m1
+            }
+            val bc = (lo + hi) / 2.0
+            return bc to cost(bc, slope)
+        }
+
+        var bestSlope = 0.0
+        var bestCost = bestBc(0.0).second
+        var s = -SLOPE_MAX
+        while (s <= SLOPE_MAX + 1e-9) {
+            val c = bestBc(s).second
+            if (c < bestCost) {
+                bestCost = c
+                bestSlope = s
+            }
+            s += 0.5
+        }
+        var lo = (bestSlope - 0.5).coerceAtLeast(-SLOPE_MAX)
+        var hi = (bestSlope + 0.5).coerceAtMost(SLOPE_MAX)
+        repeat(24) {
+            val m1 = lo + (hi - lo) / 3.0
+            val m2 = hi - (hi - lo) / 3.0
+            if (bestBc(m1).second <= bestBc(m2).second) hi = m2 else lo = m1
+        }
+        val slope = (lo + hi) / 2.0
+        val (bc, finalCost) = bestBc(slope)
+
+        // Uncertainty of the slope from the Jacobian: cov = σ² (JᵀJ)⁻¹.
+        val n = shots.size
+        val rms = sqrt(finalCost / n)
+        val sigma = if (n > 2) maxOf(chronoSigmaMps, rms * sqrt(n / (n - 2.0))) else chronoSigmaMps
+        val hBc = bc * 1e-3
+        val hS = 1e-3
+        var a11 = 0.0
+        var a12 = 0.0
+        var a22 = 0.0
+        for (shot in shots) {
+            fun v(b: Double, sl: Double) = speedAt(shot.v0, shot.distanceM, b, air, DragModel.G1, sl, center)
+            val jb = (v(bc + hBc, slope) - v(bc - hBc, slope)) / (2 * hBc)
+            val js = (v(bc, slope + hS) - v(bc, slope - hS)) / (2 * hS)
+            a11 += jb * jb
+            a12 += jb * js
+            a22 += js * js
+        }
+        val det = a11 * a22 - a12 * a12
+        val slopeSd = if (det > 1e-12) sigma * sqrt(a11 / det) else Double.POSITIVE_INFINITY
+
+        val span = machMax - machMin
+        val bcSlow = bcAtMach(bc, slope, center, machMin)
+        val bcFast = bcAtMach(bc, slope, center, machMax)
+        val changePct = (bcSlow / bcFast - 1.0) * 100.0
+        val changeSdPct = slopeSd * span * 100.0
+        val points = ArrayList<CdmPoint>()
+        val first = Math.ceil(machMin * 100.0) / 100.0
+        points.add(CdmPoint(machMin, bcSlow))
+        var m = first
+        while (m < machMax - 1e-9) {
+            if (m > machMin + 1e-9) points.add(CdmPoint(m, bcAtMach(bc, slope, center, m)))
+            m += 0.01
+        }
+        points.add(CdmPoint(machMax, bcFast))
+        return CdmFit(
+            bc = bc, slope = slope, machCenter = center, machMin = machMin, machMax = machMax,
+            speedMin = machMin * sos, speedMax = machMax * sos,
+            bcSlow = bcSlow, bcFast = bcFast, changePct = changePct, changeSdPct = changeSdPct,
+            meanAbsErrorMps = shots.sumOf {
+                kotlin.math.abs(speedAt(it.v0, it.distanceM, bc, air, DragModel.G1, slope, center) - it.speedMps)
+            } / n,
+            shots = n, points = points,
+        )
+    }
+
+    private const val SLOPE_MAX = 4.0
+
     private fun bcForShot(shot: Shot, air: Air, model: DragModel): Double {
         val slow = speedAt(shot.v0, shot.distanceM, BC_MIN, air, model)
         val fast = speedAt(shot.v0, shot.distanceM, BC_MAX, air, model)
@@ -165,3 +283,28 @@ data class Fit(
     val meanAbsErrorMps: Double,
     val limited: Boolean,
 )
+
+/** One point of the CDM curve: equivalent G1 BC at this Mach. */
+data class CdmPoint(val mach: Double, val bc: Double)
+
+data class CdmFit(
+    val bc: Double,
+    val slope: Double,
+    val machCenter: Double,
+    val machMin: Double,
+    val machMax: Double,
+    val speedMin: Double,
+    val speedMax: Double,
+    val bcSlow: Double,
+    val bcFast: Double,
+    /** How much BC at the slow end differs from the fast end, %. */
+    val changePct: Double,
+    /** One standard deviation of [changePct] from chronograph noise. */
+    val changeSdPct: Double,
+    val meanAbsErrorMps: Double,
+    val shots: Int,
+    val points: List<CdmPoint>,
+) {
+    /** The change is larger than twice its noise. */
+    val significant: Boolean get() = kotlin.math.abs(changePct) > 2.0 * changeSdPct
+}
